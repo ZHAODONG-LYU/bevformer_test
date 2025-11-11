@@ -135,9 +135,11 @@ class SpatialCrossAttention(BaseModule):
 
         D = reference_points_cam.size(3)
         indexes = []
+        SAMPLE_STRIDE = 2  # Set to 2 for 50% sampling, 3 for 33%, etc.
         for i, mask_per_img in enumerate(bev_mask):
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
-            indexes.append(index_query_per_img)
+            sampled_index_query_per_img = index_query_per_img[::SAMPLE_STRIDE]
+            indexes.append(sampled_index_query_per_img)
         max_len = max([len(each) for each in indexes])
 
         # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.

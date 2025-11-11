@@ -9,6 +9,10 @@
 _base_ = [
     '../_base_/default_runtime.py'
 ]
+
+# Allow unused parameters in DDP (for disabled mono branch)
+find_unused_parameters = True
+
 # Dataset
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
@@ -109,7 +113,7 @@ data = dict(
         type='CustomNuScenesDatasetV2',
         frames=frames,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes_infos_temporal_train.pkl',
+        ann_file='data/nuscenes/raw/nuscenes_infos_temporal_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -124,26 +128,36 @@ data = dict(
     val=dict(
         type='CustomNuScenesDatasetV2',
         frames=frames,
-        data_root='data/nuscenes/',
-        ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+        data_root=data_root,
+        ann_file='data/nuscenes/raw/nuscenes_infos_temporal_val.pkl',
         pipeline=eval_pipeline,
         classes=class_names,
         modality=input_modality,
-        samples_per_gpu=1),
+        samples_per_gpu=1,
+        mono_cfg=dict(
+            name='nusc_mini_val',
+            data_root='data/nuscenes/',
+            min_num_lidar_points=3,
+            min_box_visibility=0.2)),
     test=dict(
         type='CustomNuScenesDatasetV2',
         frames=frames,
-        data_root='data/nuscenes/',
-        ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+        data_root=data_root,
+        ann_file='data/nuscenes/raw/nuscenes_infos_temporal_val.pkl',
         pipeline=eval_pipeline,
         classes=class_names,
-        modality=input_modality),
+        modality=input_modality,
+        mono_cfg=dict(
+            name='nusc_mini_val',
+            data_root='data/nuscenes/',
+            min_num_lidar_points=3,
+            min_box_visibility=0.2)),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
     nonshuffler_sampler=dict(type='DistributedSampler'))
 evaluation = dict(interval=4, pipeline=eval_pipeline)
 
 # model
-load_from = './ckpts/fcos_r50_coco_2mmdet.pth'
+load_from = 'ckpts/bevformerV2-t1-base-24ep.pth'
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 _dim_ = 256
@@ -158,7 +172,7 @@ model = dict(
     video_test_mode=False,
     num_levels=_num_levels_,
     num_mono_levels=_num_mono_levels_,
-    mono_loss_weight=1.0,
+    mono_loss_weight=0.0,
     frames=frames,
     img_backbone=dict(
         type='ResNet',
@@ -331,19 +345,21 @@ model = dict(
 # optimizer
 optimizer = dict(
     type='AdamW',
-    lr=4e-4,
+    lr=4e-5,  # Increased learning rate for final fine-tuning (was 2e-5)
     paramwise_cfg=dict(
         custom_keys=dict(
             img_backbone=dict(lr_mult=0.5),
         )),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+# fp16 training
+fp16 = dict(loss_scale=512.)
 # learning policy
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=2000,
+    warmup_iters=500,  # Shorter warmup for final fine-tuning
     warmup_ratio=1.0 / 3,
-    step=[20, ])
-total_epochs = 24
+    step=[10, ])  # Step at epoch 10 (if training more epochs)
+total_epochs = 9  # Resume from epoch_8.pth and train to epoch 9 (will be saved as epoch_9.pth)
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)

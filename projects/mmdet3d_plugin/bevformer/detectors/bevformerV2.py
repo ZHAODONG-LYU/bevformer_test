@@ -7,6 +7,7 @@
 import copy
 from collections import OrderedDict
 import torch
+from mmcv.runner import auto_fp16, force_fp32
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
@@ -183,6 +184,7 @@ class BEVFormerV2(MVXTwoStageDetector):
             self.train()
         return list(prev_bev.values())
 
+    @auto_fp16(apply_to=('img',))
     def forward_train(self,
                       points=None,
                       img_metas=None,
@@ -214,7 +216,7 @@ class BEVFormerV2(MVXTwoStageDetector):
                                             gt_bboxes_ignore, prev_bev)
         losses.update(losses_pts)
 
-        if self.fcos3d_bbox_head:
+        if self.fcos3d_bbox_head and self.mono_loss_weight > 0:
             losses_mono = self.forward_mono_train(img_feats=img_feats if self.num_mono_levels is None
             else img_feats[:self.num_mono_levels],
                                                   mono_input_dict=mono_input_dict)
