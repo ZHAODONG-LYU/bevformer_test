@@ -7,6 +7,8 @@
 
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import warnings
+import logging
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +49,7 @@ class SpatialCrossAttention(BaseModule):
                  num_cams=6,
                  pc_range=None,
                  dropout=0.1,
+                 debug_bev_query=False,
                  init_cfg=None,
                  batch_first=False,
                  deformable_attention=dict(
@@ -58,6 +61,8 @@ class SpatialCrossAttention(BaseModule):
         super(SpatialCrossAttention, self).__init__(init_cfg)
 
         self.init_cfg = init_cfg
+        self._debug_print_count = 0  # rate limit for optional debug
+        self.debug_bev_query = debug_bev_query
         self.dropout = nn.Dropout(dropout)
         self.pc_range = pc_range
         self.fp16_enabled = False
@@ -135,12 +140,114 @@ class SpatialCrossAttention(BaseModule):
 
         D = reference_points_cam.size(3)
         indexes = []
-        SAMPLE_STRIDE = 2  # Set to 2 for 50% sampling, 3 for 33%, etc.
+        # Distance-based non-uniform sampling: near dense, far sparse
+        # Hyper-parameters (in BEV cell units assuming square BEV, e.g., 200x200)
+        R_INNER, R_MID = 40.0, 80.0
+        STRIDE_INNER, STRIDE_MID, STRIDE_OUTER = 1, 2, 4
+        # num_query == bev_h * bev_w, assume square grid for coordinate recovery
+        grid_size = int(num_query ** 0.5)
+        cx, cy = (grid_size - 1) / 2.0, (grid_size - 1) / 2.0
+
         for i, mask_per_img in enumerate(bev_mask):
+            # keep the same visible index derivation as before
             index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
-            sampled_index_query_per_img = index_query_per_img[::SAMPLE_STRIDE]
+
+            if index_query_per_img.numel() == 0:
+                indexes.append(index_query_per_img)
+                continue
+
+            # map linear indices -> (y, x) on BEV grid
+            ys = (index_query_per_img // grid_size).to(dtype=torch.float32)
+            xs = (index_query_per_img % grid_size).to(dtype=torch.float32)
+            rs = ((xs - cx) ** 2 + (ys - cy) ** 2).sqrt()
+
+            mask_inner = rs <= R_INNER
+            mask_mid = (rs > R_INNER) & (rs <= R_MID)
+            mask_outer = rs > R_MID
+
+            idx_inner = index_query_per_img[mask_inner][::STRIDE_INNER]
+            idx_mid = index_query_per_img[mask_mid][::STRIDE_MID]
+            idx_outer = index_query_per_img[mask_outer][::STRIDE_OUTER]
+
+            sampled_index_query_per_img = torch.cat([idx_inner, idx_mid, idx_outer], dim=0)
             indexes.append(sampled_index_query_per_img)
         max_len = max([len(each) for each in indexes])
+
+        # Optional debug print for effective BEV queries:
+        # Enabled when debug_bev_query=True (via cfg), or auto-enabled for NuScenes-mini.
+        def _contains_nuscenes_mini(meta):
+            try:
+                if isinstance(meta, dict):
+                    # common fields to check directly first
+                    for k in ('data_root', 'ann_file', 'img_filename', 'filename', 'ori_filename'):
+                        if k in meta and isinstance(meta[k], str):
+                            s = meta[k].lower()
+                            if ('nuscenes-mini' in s) or ('v1.0-mini' in s) or ('/mini/' in s) or s.endswith('-mini'):
+                                return True
+                    # some datasets store version explicitly
+                    for k in ('version', 'nus_version', 'dataset_version'):
+                        if k in meta and isinstance(meta[k], str):
+                            s = meta[k].lower()
+                            if ('v1.0-mini' in s) or ('mini' in s):
+                                return True
+                    for v in meta.values():
+                        if _contains_nuscenes_mini(v):
+                            return True
+                elif isinstance(meta, (list, tuple)):
+                    for v in meta:
+                        if _contains_nuscenes_mini(v):
+                            return True
+                elif isinstance(meta, str):
+                    s = meta.lower()
+                    return ('nuscenes-mini' in s) or ('v1.0-mini' in s) or ('/mini/' in s) or s.endswith('-mini')
+            except Exception:
+                return False
+            return False
+
+        is_mini = False
+        try:
+            img_metas = kwargs.get('img_metas', None)
+            if img_metas is not None and len(img_metas) > 0:
+                # img_metas is a list with length == bs
+                # check the first meta as representative
+                is_mini = _contains_nuscenes_mini(img_metas[0])
+        except Exception:
+            is_mini = False
+
+        # only print on rank0 (or non-distributed) to ensure visibility with multi-GPU
+        def _is_rank0():
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    return dist.get_rank() == 0
+            except Exception:
+                pass
+            return True
+
+        # Unconditional debug printing (rate-limited, rank0 only), for all datasets
+        force_debug = True
+        if (force_debug and self._debug_print_count < 3 and _is_rank0()):
+            try:
+                per_cam_total = [int(mask_per_img[0].sum(-1).nonzero().numel()) for mask_per_img in bev_mask]
+                per_cam_kept = [int(idx.numel()) for idx in indexes]
+                kept_sum = int(sum(per_cam_kept))
+                total_sum = int(sum(per_cam_total))
+                ratio = (kept_sum / max(total_sum, 1)) if total_sum > 0 else 0.0
+                msg = (f"[BEV DEBUG] kept_queries_per_cam={per_cam_kept} / total_per_cam={per_cam_total} "
+                       f"=> kept_sum={kept_sum}, total_sum={total_sum}, ratio={ratio:.3f}, max_len_batch={max_len}")
+                # stdout/stderr to ensure visibility with DDP, plus logger for logs
+                try:
+                    sys.stderr.write(msg + "\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    logging.getLogger(__name__).warning(msg)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self._debug_print_count += 1
 
         # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
         queries_rebatch = query.new_zeros(

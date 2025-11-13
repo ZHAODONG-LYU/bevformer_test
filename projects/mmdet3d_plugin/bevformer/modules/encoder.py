@@ -34,10 +34,12 @@ class BEVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
+                 debug_bev_query_global=False,
                  **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
+        self.debug_bev_query_global = debug_bev_query_global
 
         self.num_points_in_pillar = num_points_in_pillar
         self.pc_range = pc_range
@@ -303,6 +305,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 spatial_shapes=None,
                 level_start_index=None,
                 prev_bev=None,
+                debug_bev_query_global=False,
                 **kwargs):
         """Forward function for `TransformerDecoderLayer`.
 
@@ -394,6 +397,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     key_padding_mask=key_padding_mask,
                     spatial_shapes=spatial_shapes,
                     level_start_index=level_start_index,
+                    debug_bev_query_global=debug_bev_query_global,
                     **kwargs)
                 attn_index += 1
                 identity = query
