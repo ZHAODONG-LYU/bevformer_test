@@ -140,10 +140,12 @@ class SpatialCrossAttention(BaseModule):
 
         D = reference_points_cam.size(3)
         indexes = []
-        # Distance-based non-uniform sampling: near dense, far sparse
-        # Hyper-parameters (in BEV cell units assuming square BEV, e.g., 200x200)
+        # Distance-based sampling with fixed per-camera budgets (hardware friendly).
+        # Radii expressed in BEV cell units (e.g., 200x200 grid).
         R_INNER, R_MID = 40.0, 80.0
-        STRIDE_INNER, STRIDE_MID, STRIDE_OUTER = 1, 2, 4
+        TARGET_QUERIES_PER_CAM = 5000
+        KEEP_RATIO_MID = 0.75
+        KEEP_RATIO_OUTER = 0.10
         # num_query == bev_h * bev_w, assume square grid for coordinate recovery
         grid_size = int(num_query ** 0.5)
         cx, cy = (grid_size - 1) / 2.0, (grid_size - 1) / 2.0
@@ -159,17 +161,84 @@ class SpatialCrossAttention(BaseModule):
             # map linear indices -> (y, x) on BEV grid
             ys = (index_query_per_img // grid_size).to(dtype=torch.float32)
             xs = (index_query_per_img % grid_size).to(dtype=torch.float32)
-            rs = ((xs - cx) ** 2 + (ys - cy) ** 2).sqrt()
+            dist2 = (xs - cx) ** 2 + (ys - cy) ** 2
 
-            mask_inner = rs <= R_INNER
-            mask_mid = (rs > R_INNER) & (rs <= R_MID)
-            mask_outer = rs > R_MID
+            mask_inner = dist2 <= (R_INNER ** 2)
+            mask_mid = (dist2 > (R_INNER ** 2)) & (dist2 <= (R_MID ** 2))
+            mask_outer = dist2 > (R_MID ** 2)
 
-            idx_inner = index_query_per_img[mask_inner][::STRIDE_INNER]
-            idx_mid = index_query_per_img[mask_mid][::STRIDE_MID]
-            idx_outer = index_query_per_img[mask_outer][::STRIDE_OUTER]
+            idx_inner = index_query_per_img[mask_inner]
+            idx_mid = index_query_per_img[mask_mid]
+            idx_outer = index_query_per_img[mask_outer]
 
-            sampled_index_query_per_img = torch.cat([idx_inner, idx_mid, idx_outer], dim=0)
+            dist_inner = dist2[mask_inner]
+            dist_mid = dist2[mask_mid]
+            dist_outer = dist2[mask_outer]
+
+            # Sort by distance (closer first)
+            if idx_inner.numel() > 0:
+                order_inner = torch.argsort(dist_inner, descending=False)
+                idx_inner = idx_inner[order_inner]
+            if idx_mid.numel() > 0:
+                order_mid = torch.argsort(dist_mid, descending=False)
+                idx_mid = idx_mid[order_mid]
+            if idx_outer.numel() > 0:
+                order_outer = torch.argsort(dist_outer, descending=False)
+                idx_outer = idx_outer[order_outer]
+
+            # Fixed budget allocation
+            available_total = index_query_per_img.numel()
+            target_keep = min(TARGET_QUERIES_PER_CAM, available_total)
+            remaining = target_keep
+
+            # Inner: keep all (priority 1)
+            keep_inner = min(idx_inner.numel(), remaining)
+            remaining -= keep_inner
+
+            # Mid: keep 75% (priority 2)
+            def _preferred_keep(total, ratio):
+                if total == 0 or ratio <= 0:
+                    return 0
+                keep = int(total * ratio)
+                if keep == 0 and total > 0:
+                    keep = 1
+                return min(keep, total)
+
+            keep_mid = min(_preferred_keep(idx_mid.numel(), KEEP_RATIO_MID), remaining)
+            remaining -= keep_mid
+
+            # Outer: keep 10% (priority 3)
+            keep_outer = min(_preferred_keep(idx_outer.numel(), KEEP_RATIO_OUTER), remaining)
+            remaining -= keep_outer
+
+            # Backfill to reach target_keep if still have budget
+            if remaining > 0 and idx_mid.numel() > keep_mid:
+                extra_mid = min(idx_mid.numel() - keep_mid, remaining)
+                keep_mid += extra_mid
+                remaining -= extra_mid
+            if remaining > 0 and idx_outer.numel() > keep_outer:
+                extra_outer = min(idx_outer.numel() - keep_outer, remaining)
+                keep_outer += extra_outer
+                remaining -= extra_outer
+            if remaining > 0 and idx_inner.numel() > keep_inner:
+                extra_inner = min(idx_inner.numel() - keep_inner, remaining)
+                keep_inner += extra_inner
+                remaining -= extra_inner
+
+            # Collect final selection
+            selected = []
+            if keep_inner > 0:
+                selected.append(idx_inner[:keep_inner])
+            if keep_mid > 0:
+                selected.append(idx_mid[:keep_mid])
+            if keep_outer > 0:
+                selected.append(idx_outer[:keep_outer])
+
+            if selected:
+                sampled_index_query_per_img = torch.cat(selected, dim=0)
+            else:
+                sampled_index_query_per_img = index_query_per_img.new_empty(0)
+
             indexes.append(sampled_index_query_per_img)
         max_len = max([len(each) for each in indexes])
 
